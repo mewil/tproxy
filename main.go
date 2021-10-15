@@ -7,20 +7,28 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 
 	"golang.org/x/net/proxy"
 	"tailscale.com/client/tailscale"
 )
 
-func newProxy(target *url.URL, userHeader string) *httputil.ReverseProxy {
-	targetQuery := target.RawQuery
+type pathConfig struct {
+	target *url.URL
+	path   string
+}
+
+func newProxy(pathConfigs []pathConfig, userHeader string) *httputil.ReverseProxy {
+	for _, config := range pathConfigs {
+		log.Printf("%+v", config)
+	}
 	director := func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		if targetQuery == "" || req.URL.RawQuery == "" {
-			req.URL.RawQuery = targetQuery + req.URL.RawQuery
-		} else {
-			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
+		for _, config := range pathConfigs {
+			if strings.HasPrefix(req.URL.Path, config.path) {
+				req.URL.Scheme = config.target.Scheme
+				req.URL.Host = config.target.Host
+				break
+			}
 		}
 		if _, ok := req.Header["User-Agent"]; !ok {
 			// explicitly disable User-Agent so it's not set to default value
@@ -42,12 +50,37 @@ func newProxy(target *url.URL, userHeader string) *httputil.ReverseProxy {
 	}
 }
 
-func main() {
-	t, err := url.Parse(os.Getenv("TPROXY_TARGET_ADDR"))
-	if err != nil {
-		log.Fatal("failed to parse TPROXY_TARGET_ADDR", err)
+func parsePathConfigs() []pathConfig {
+	if targetAddr, ok := os.LookupEnv("TPROXY_TARGET_ADDR"); ok {
+		target, err := url.Parse(targetAddr)
+		if err != nil {
+			log.Fatal("failed to parse TPROXY_TARGET_ADDR", err)
+		}
+		return []pathConfig{{target, ""}}
 	}
-	p := newProxy(t, os.Getenv("TPROXY_USER_HEADER"))
+	if config, ok := os.LookupEnv("TPROXY_TARGET_PATH_CONFIGS"); ok {
+		configStrings := strings.Split(config, ",")
+		pathConfigs := make([]pathConfig, len(configStrings))
+		for i, configString := range configStrings {
+			subStrings := strings.SplitN(configString, "#", 2)
+			path := ""
+			if len(subStrings) == 2 {
+				path = subStrings[0]
+			}
+			target, err := url.Parse(subStrings[len(subStrings)-1])
+			if err != nil {
+				log.Fatal("failed to parse TPROXY_TARGET_PATH_CONFIGS", err)
+			}
+			pathConfigs[i] = pathConfig{target, path}
+		}
+		return pathConfigs
+	}
+	log.Fatal("no target address specified, use the TPROXY_TARGET_ADDR or TPROXY_TARGET_PATH_CONFIGS env variables")
+	return nil
+}
+
+func main() {
+	p := newProxy(parsePathConfigs(), os.Getenv("TPROXY_USER_HEADER"))
 	s := &http.Server{
 		TLSConfig: &tls.Config{
 			GetCertificate: tailscale.GetCertificate,
